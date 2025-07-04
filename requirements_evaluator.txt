@@ -1,0 +1,6 @@
+torch>=1.7.1
+torchvision>=0.8.2
+clip @ git+https://github.com/openai/CLIP.git
+Pillow>=8.0.0
+numpy>=1.19.0
+gradio>=3.0.0
