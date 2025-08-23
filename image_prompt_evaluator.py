@@ -4,6 +4,9 @@ import clip
 import os
 import numpy as np
 import re
+import nltk
+from nltk.corpus import stopwords
+from nltk.tokenize import word_tokenize
 
 class ImagePromptEvaluator:
     def __init__(self):
@@ -11,6 +14,28 @@ class ImagePromptEvaluator:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model, self.preprocess = clip.load("ViT-B/32", device=self.device)
         print(f"Model loaded on {self.device}")
+        
+        # Download NLTK data if not already present
+        try:
+            nltk.data.find('corpora/stopwords')
+        except LookupError:
+            print("Downloading NLTK stopwords data...")
+            nltk.download('stopwords', quiet=True)
+        
+        try:
+            nltk.data.find('tokenizers/punkt')
+        except LookupError:
+            print("Downloading NLTK punkt tokenizer data...")
+            nltk.download('punkt', quiet=True)
+        
+        # Get English stop words from NLTK
+        self.stop_words = set(stopwords.words('english'))
+        
+        # Add some domain-specific stop words for image prompts
+        self.stop_words.update({
+            'image', 'photo', 'picture', 'showing', 'contains', 'featuring',
+            'depicts', 'displays', 'includes', 'scene', 'view'
+        })
         
         # Calibration scores for normalization
         self.baseline_scores = self._get_baseline_scores()
@@ -146,6 +171,157 @@ class ImagePromptEvaluator:
         
         return similarity_score
     
+    def _extract_important_keywords(self, prompt):
+        """Extract the most important keywords from prompt using NLTK stop words"""
+        # Use NLTK's comprehensive stop words collection plus domain-specific ones
+        # self.stop_words is already initialized in __init__ with NLTK stop words
+        
+        words = prompt.lower().split()
+        important_words = []
+        
+        for word in words:
+            # Clean word
+            clean_word = re.sub(r'[^\w]', '', word)
+            
+            # Keep if: long enough, not a stop word, and likely meaningful
+            if (len(clean_word) > 2 and 
+                clean_word not in self.stop_words and
+                not clean_word.isdigit()):
+                important_words.append(clean_word)
+        
+        return important_words[:8]  # Limit to most important 8 keywords
+    
+    def _get_feature_status(self, feature_score, overall_score):
+        """Determine status of a feature relative to overall image match"""
+        if feature_score < 0.15:
+            return "missing"
+        elif feature_score < 0.22:
+            return "weak"
+        elif feature_score < overall_score - 0.05:
+            return "below_average"
+        else:
+            return "present"
+    
+    def _analyze_missing_features(self, image_path, prompt, overall_similarity):
+        """Enhanced analysis of missing features with better feedback"""
+        
+        # Extract important keywords (nouns, adjectives, key descriptors)
+        important_keywords = self._extract_important_keywords(prompt)
+        
+        image = Image.open(image_path)
+        image_input = self.preprocess(image).unsqueeze(0).to(self.device)
+        
+        missing_features = []
+        present_features = []
+        weak_features = []
+        
+        with torch.no_grad():
+            image_features = self.model.encode_image(image_input)
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+            
+            for keyword in important_keywords:
+                # Test multiple variations for better detection
+                test_prompts = [
+                    f"an image containing {keyword}",
+                    f"a photo showing {keyword}",
+                    f"{keyword}",
+                    f"featuring {keyword}",
+                    f"with {keyword}"
+                ]
+                
+                kw_similarities = []
+                for test_prompt in test_prompts:
+                    text_input = clip.tokenize([test_prompt], truncate=True).to(self.device)
+                    text_features = self.model.encode_text(text_input)
+                    text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+                    
+                    kw_similarity = (image_features @ text_features.T).item()
+                    kw_similarities.append(kw_similarity)
+                
+                best_score = max(kw_similarities)
+                confidence = self._normalize_score(best_score)
+                
+                # Categorize features based on confidence
+                feature_info = {
+                    "keyword": keyword,
+                    "confidence": confidence,
+                    "raw_score": best_score,
+                    "status": self._get_feature_status(best_score, overall_similarity)
+                }
+                
+                if best_score < 0.15:  # Clearly missing
+                    missing_features.append(feature_info)
+                elif best_score < 0.22:  # Weakly present
+                    weak_features.append(feature_info)
+                else:  # Clearly present
+                    present_features.append(feature_info)
+        
+        return {
+            "missing_features": missing_features,
+            "weak_features": weak_features,
+            "present_features": present_features,
+            "missing_count": len(missing_features),
+            "weak_count": len(weak_features),
+            "total_features": len(important_keywords)
+        }
+    
+    def _calculate_missing_feature_penalty(self, missing_analysis, overall_similarity):
+        """Apply penalty based on missing critical features"""
+        missing_count = missing_analysis["missing_count"]
+        weak_count = missing_analysis["weak_count"]
+        total_count = missing_analysis["total_features"]
+        
+        if total_count == 0:
+            return overall_similarity
+        
+        missing_ratio = missing_count / total_count
+        weak_ratio = weak_count / total_count
+        
+        # Apply graduated penalty based on missing feature ratio
+        penalty = 0
+        if missing_ratio > 0.6:  # More than 60% missing
+            penalty = 0.3
+        elif missing_ratio > 0.4:  # More than 40% missing
+            penalty = 0.2
+        elif missing_ratio > 0.2:  # More than 20% missing
+            penalty = 0.1
+        
+        # Additional penalty for weak features
+        if weak_ratio > 0.4:
+            penalty += 0.1
+        elif weak_ratio > 0.2:
+            penalty += 0.05
+        
+        penalty = min(penalty, 0.4)  # Cap maximum penalty at 40%
+        return overall_similarity * (1 - penalty)
+    
+    def _generate_missing_feature_feedback(self, missing_analysis):
+        """Generate human-readable feedback about missing features"""
+        missing = missing_analysis["missing_features"]
+        weak = missing_analysis["weak_features"]
+        present = missing_analysis["present_features"]
+        
+        feedback = []
+        
+        if missing:
+            missing_names = [f["keyword"] for f in missing]
+            feedback.append(f"❌ Missing features: {', '.join(missing_names[:4])}")
+        
+        if weak:
+            weak_names = [f["keyword"] for f in weak]
+            feedback.append(f"⚠️  Weak features: {', '.join(weak_names[:3])}")
+        
+        if len(missing) + len(weak) == 0:
+            feedback.append("✅ All key features are well represented")
+        elif len(present) > len(missing) + len(weak):
+            feedback.append("✅ Most features are present")
+        
+        # Specific improvement suggestions
+        if missing:
+            feedback.append(f"💡 Consider regenerating to include: {', '.join(missing_names[:3])}")
+        
+        return " | ".join(feedback)
+    
     def _normalize_score(self, raw_score):
         """Normalize CLIP scores to a more intuitive 0-100% range - improved"""
         # Better normalization that doesn't penalize good matches
@@ -164,59 +340,123 @@ class ImagePromptEvaluator:
             return 80 + min(20, (raw_score - 0.30) * 200)  # 80-100%
     
     def evaluate_image(self, image_path, prompt, threshold=0.20):
-        """Evaluate if the generated image matches the prompt with better thresholds"""
+        """Evaluate if the generated image matches the prompt with enhanced missing feature analysis"""
         similarity, metrics = self.calculate_similarity(image_path, prompt)
-        normalized_score = metrics["normalized_score"]
         
-        # Better quality thresholds based on actual CLIP behavior
-        if similarity > 0.28:
+        # Analyze missing features
+        missing_analysis = self._analyze_missing_features(image_path, prompt, similarity)
+        
+        # Apply missing feature penalty
+        adjusted_similarity = self._calculate_missing_feature_penalty(missing_analysis, similarity)
+        adjusted_normalized = self._normalize_score(adjusted_similarity)
+        
+        # Generate missing feature feedback
+        missing_feedback = self._generate_missing_feature_feedback(missing_analysis)
+        
+        # Calculate penalty applied
+        missing_penalty = similarity - adjusted_similarity
+        
+        # Better quality thresholds based on adjusted similarity
+        if adjusted_similarity > 0.28:
             quality = "Excellent"
             feedback = "The image closely matches the prompt."
-        elif similarity > 0.22:
+        elif adjusted_similarity > 0.22:
             quality = "Good"
             feedback = "The image generally matches the prompt."
-        elif similarity > 0.18:
+        elif adjusted_similarity > 0.18:
             quality = "Fair"
             feedback = "The image somewhat matches the prompt but could be improved."
         else:
             quality = "Poor"
             feedback = "The image doesn't seem to match the prompt well."
         
-        # Fixed keyword analysis - no recursive calls
-        keywords = [word for word in prompt.lower().split() if len(word) > 3]
-        keyword_checks = []
+        # Enhanced keyword analysis using the new system
+        enhanced_keyword_checks = []
         
-        # Load image once for keyword analysis
-        image = Image.open(image_path)
-        image_input = self.preprocess(image).unsqueeze(0).to(self.device)
+        # Add present features
+        for feature in missing_analysis["present_features"]:
+            enhanced_keyword_checks.append({
+                "keyword": feature["keyword"],
+                "present": True,
+                "confidence": f"{feature['confidence']:.1f}%",
+                "raw_score": feature["raw_score"],
+                "status": "✅ present",
+                "status_type": "present"
+            })
         
-        with torch.no_grad():
-            image_features = self.model.encode_image(image_input)
-            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        # Add weak features
+        for feature in missing_analysis["weak_features"]:
+            enhanced_keyword_checks.append({
+                "keyword": feature["keyword"],
+                "present": False,
+                "confidence": f"{feature['confidence']:.1f}%",
+                "raw_score": feature["raw_score"],
+                "status": "⚠️  weak",
+                "status_type": "weak"
+            })
+        
+        # Add missing features
+        for feature in missing_analysis["missing_features"]:
+            enhanced_keyword_checks.append({
+                "keyword": feature["keyword"],
+                "present": False,
+                "confidence": f"{feature['confidence']:.1f}%",
+                "raw_score": feature["raw_score"],
+                "status": "❌ missing",
+                "status_type": "missing"
+            })
+        
+        # Fallback to original keyword analysis for any remaining words
+        # Use the same NLTK stop words from __init__
+        
+        # Get remaining keywords, filtering out stop words
+        original_keywords = []
+        for word in prompt.lower().split():
+            clean_word = re.sub(r'[^\w]', '', word)
+            if (len(clean_word) > 3 and 
+                clean_word not in self.stop_words and 
+                not clean_word.isdigit()):
+                original_keywords.append(clean_word)
+        
+        analyzed_keywords = [f["keyword"] for f in missing_analysis["present_features"] + 
+                           missing_analysis["weak_features"] + missing_analysis["missing_features"]]
+        
+        remaining_keywords = [kw for kw in original_keywords if kw not in analyzed_keywords]
+        
+        if remaining_keywords:
+            # Load image once for remaining keyword analysis
+            image = Image.open(image_path)
+            image_input = self.preprocess(image).unsqueeze(0).to(self.device)
             
-            for keyword in keywords:
-                test_prompts = [
-                    f"an image containing {keyword}",
-                    f"a photo of {keyword}",
-                    f"{keyword}"
-                ]
+            with torch.no_grad():
+                image_features = self.model.encode_image(image_input)
+                image_features = image_features / image_features.norm(dim=-1, keepdim=True)
                 
-                kw_similarities = []
-                for test_prompt in test_prompts:
-                    text_input = clip.tokenize([test_prompt], truncate=True).to(self.device)
-                    text_features = self.model.encode_text(text_input)
-                    text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+                for keyword in remaining_keywords:
+                    test_prompts = [
+                        f"an image containing {keyword}",
+                        f"a photo of {keyword}",
+                        f"{keyword}"
+                    ]
                     
-                    kw_similarity = (image_features @ text_features.T).item()
-                    kw_similarities.append(kw_similarity)
-                
-                best_kw_sim = max(kw_similarities)
-                keyword_checks.append({
-                    "keyword": keyword,
-                    "present": best_kw_sim > 0.20,  # More conservative threshold
-                    "confidence": f"{self._normalize_score(best_kw_sim):.1f}%",
-                    "raw_score": best_kw_sim
-                })
+                    kw_similarities = []
+                    for test_prompt in test_prompts:
+                        text_input = clip.tokenize([test_prompt], truncate=True).to(self.device)
+                        text_features = self.model.encode_text(text_input)
+                        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+                        
+                        kw_similarity = (image_features @ text_features.T).item()
+                        kw_similarities.append(kw_similarity)
+                    
+                    best_kw_sim = max(kw_similarities)
+                    enhanced_keyword_checks.append({
+                        "keyword": keyword,
+                        "present": best_kw_sim > 0.20,
+                        "confidence": f"{self._normalize_score(best_kw_sim):.1f}%",
+                        "raw_score": best_kw_sim,
+                        "status": "✓" if best_kw_sim > 0.20 else "✗",
+                        "status_type": "present" if best_kw_sim > 0.20 else "missing"
+                    })
         
         # More accurate contradiction warning
         contradiction_warning = ""
@@ -224,16 +464,22 @@ class ImagePromptEvaluator:
             contradiction_warning = "⚠️  Semantic contradiction detected - score adjusted downward."
         
         return {
-            "overall_score": similarity,
-            "percentage_match": f"{normalized_score:.2f}%",
+            "overall_score": adjusted_similarity,
+            "original_score": similarity,
+            "percentage_match": f"{adjusted_normalized:.2f}%",
+            "original_percentage": f"{self._normalize_score(similarity):.2f}%",
             "raw_percentage": f"{similarity * 100:.2f}%",
             "quality": quality,
             "feedback": feedback,
             "prompt": prompt,
-            "keyword_analysis": keyword_checks,
-            "meets_threshold": similarity > threshold,
+            "keyword_analysis": enhanced_keyword_checks,
+            "meets_threshold": adjusted_similarity > threshold,
             "detailed_metrics": metrics,
-            "contradiction_warning": contradiction_warning
+            "contradiction_warning": contradiction_warning,
+            "missing_feature_analysis": missing_analysis,
+            "missing_feature_feedback": missing_feedback,
+            "missing_feature_penalty": missing_penalty,
+            "penalty_percentage": f"{(missing_penalty / similarity * 100):.1f}%" if similarity > 0 else "0.0%"
         }
 
 def main():
@@ -256,8 +502,34 @@ def main():
     print("="*50)
     print(f"Prompt: \"{results['prompt']}\"")
     print(f"Overall Match: {results['percentage_match']} ({results['quality']})")
+    
+    # Show penalty information if applied
+    if results['missing_feature_penalty'] > 0:
+        print(f"Original Score: {results['original_percentage']} → Final Score: {results['percentage_match']}")
+        print(f"Missing Feature Penalty: -{results['penalty_percentage']} applied")
+    
     print(f"Raw CLIP Score: {results['raw_percentage']}")
     print(f"Feedback: {results['feedback']}")
+    
+    # Enhanced missing feature feedback
+    if results['missing_feature_feedback']:
+        print(f"\nFeature Analysis:")
+        print(f"  {results['missing_feature_feedback']}")
+    
+    # Feature summary
+    missing_analysis = results['missing_feature_analysis']
+    total_features = missing_analysis['total_features']
+    present_count = len(missing_analysis['present_features'])
+    weak_count = len(missing_analysis['weak_features'])
+    missing_count = len(missing_analysis['missing_features'])
+    
+    if total_features > 0:
+        print(f"\nFeature Summary ({total_features} total features):")
+        print(f"  ✅ Present: {present_count}")
+        if weak_count > 0:
+            print(f"  ⚠️  Weak: {weak_count}")
+        if missing_count > 0:
+            print(f"  ❌ Missing: {missing_count}")
     
     if results['contradiction_warning']:
         print(f"\n{results['contradiction_warning']}")
@@ -270,11 +542,30 @@ def main():
             print(f"  Penalized Score: {metrics['penalized_score']:.4f}")
         print(f"  Average Score: {metrics['average_score']:.4f}")
         print(f"  All Variation Scores: {[f'{s:.3f}' for s in metrics['all_scores']]}")
+        
+        # Show detailed feature breakdown
+        if missing_analysis['present_features']:
+            print(f"\n  Present Features:")
+            for feature in missing_analysis['present_features']:
+                print(f"    ✅ {feature['keyword']} - {feature['confidence']:.1f}%")
+        
+        if missing_analysis['weak_features']:
+            print(f"\n  Weak Features:")
+            for feature in missing_analysis['weak_features']:
+                print(f"    ⚠️  {feature['keyword']} - {feature['confidence']:.1f}%")
+        
+        if missing_analysis['missing_features']:
+            print(f"\n  Missing Features:")
+            for feature in missing_analysis['missing_features']:
+                print(f"    ❌ {feature['keyword']} - {feature['confidence']:.1f}%")
     
-    print("\nKeyword Analysis:")
+    print("\nDetailed Keyword Analysis:")
     for kw in results['keyword_analysis']:
-        status = "✓" if kw['present'] else "✗"
-        print(f"  {status} {kw['keyword']} - {kw['confidence']} (raw: {kw['raw_score']:.3f})")
+        if 'status' in kw:
+            print(f"  {kw['status']} {kw['keyword']} - {kw['confidence']} (raw: {kw['raw_score']:.3f})")
+        else:
+            status = "✓" if kw['present'] else "✗"
+            print(f"  {status} {kw['keyword']} - {kw['confidence']} (raw: {kw['raw_score']:.3f})")
     
     print("="*50)
     
