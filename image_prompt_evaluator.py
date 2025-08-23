@@ -172,23 +172,28 @@ class ImagePromptEvaluator:
         return similarity_score
     
     def _extract_important_keywords(self, prompt):
-        """Extract the most important keywords from prompt using NLTK stop words"""
-        # Use NLTK's comprehensive stop words collection plus domain-specific ones
-        # self.stop_words is already initialized in __init__ with NLTK stop words
-        
-        words = prompt.lower().split()
+        """Extract the most important keywords from prompt using NLTK POS tagging for generalization"""
+        # Tokenize and POS tag the prompt
+        tokens = word_tokenize(prompt.lower())
+        tagged = nltk.pos_tag(tokens)
+        # Nouns, adjectives, and some verbs (for actions)
+        important_pos = {'NN', 'NNS', 'NNP', 'NNPS', 'JJ', 'JJR', 'JJS', 'VB', 'VBG', 'VBN'}
         important_words = []
-        
-        for word in words:
-            # Clean word
+        for word, pos in tagged:
             clean_word = re.sub(r'[^\w]', '', word)
-            
-            # Keep if: long enough, not a stop word, and likely meaningful
-            if (len(clean_word) > 2 and 
+            if (len(clean_word) > 2 and
                 clean_word not in self.stop_words and
-                not clean_word.isdigit()):
+                not clean_word.isdigit() and
+                pos in important_pos):
                 important_words.append(clean_word)
-        
+        # Fallback: if nothing found, use original logic
+        if not important_words:
+            for word in prompt.lower().split():
+                clean_word = re.sub(r'[^\w]', '', word)
+                if (len(clean_word) > 2 and 
+                    clean_word not in self.stop_words and
+                    not clean_word.isdigit()):
+                    important_words.append(clean_word)
         return important_words[:8]  # Limit to most important 8 keywords
     
     def _get_feature_status(self, feature_score, overall_score):
