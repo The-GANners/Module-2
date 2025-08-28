@@ -5,7 +5,7 @@ import os
 import numpy as np
 import re
 import nltk
-from nltk.corpus import stopwords
+from nltk.corpus import stopwords, wordnet
 from nltk.tokenize import word_tokenize
 
 class ImagePromptEvaluator:
@@ -27,6 +27,18 @@ class ImagePromptEvaluator:
         except LookupError:
             print("Downloading NLTK punkt tokenizer data...")
             nltk.download('punkt', quiet=True)
+        
+        try:
+            nltk.data.find('taggers/averaged_perceptron_tagger_eng')
+        except LookupError:
+            print("Downloading NLTK POS tagger data...")
+            nltk.download('averaged_perceptron_tagger_eng', quiet=True)
+        
+        try:
+            nltk.data.find('corpora/wordnet')
+        except LookupError:
+            print("Downloading NLTK WordNet data...")
+            nltk.download('wordnet', quiet=True)
         
         # Get English stop words from NLTK
         self.stop_words = set(stopwords.words('english'))
@@ -171,33 +183,78 @@ class ImagePromptEvaluator:
         
         return similarity_score
     
+    def _calculate_keyword_importance(self, word, pos_tag, full_text):
+        """Calculate importance weight for a keyword based on POS tag and context."""
+        base_weight = 1.0
+        
+        # POS-based weights
+        if pos_tag.startswith('NN'):  # Nouns - core objects/concepts
+            if pos_tag in ['NNP', 'NNPS']:  # Proper nouns - very important
+                base_weight = 3.0
+            else:  # Common nouns - important
+                base_weight = 2.5
+        elif pos_tag.startswith('JJ'):  # Adjectives - descriptive features
+            base_weight = 1.5
+        elif pos_tag.startswith('VB'):  # Verbs - actions
+            base_weight = 2.0
+        
+        # Semantic importance boosts
+        if self._is_animal_or_living_thing(word):
+            base_weight *= 1.5  # Animals are visually distinctive
+        
+        # Position-based importance (earlier words often more important)
+        words = full_text.lower().split()
+        try:
+            position = words.index(word)
+            position_weight = max(0.8, 1.0 - (position / len(words)) * 0.3)  # Slight preference for earlier words
+            base_weight *= position_weight
+        except ValueError:
+            pass  # Word not found in split (edge case)
+        
+        # Length-based importance (longer words often more specific)
+        if len(word) >= 6:
+            base_weight *= 1.2
+        elif len(word) <= 3:
+            base_weight *= 0.9
+            
+        return round(base_weight, 2)
+    
     def _extract_important_keywords(self, prompt):
-        """Extract the most important keywords from prompt using NLTK POS tagging for generalization"""
+        """Extract the most important keywords from prompt with importance weights"""
         # Tokenize and POS tag the prompt
         tokens = word_tokenize(prompt.lower())
         tagged = nltk.pos_tag(tokens)
-        # Nouns, adjectives, and some verbs (for actions)
+        
+        # Extract keywords with weights
+        keyword_weights = {}
         important_pos = {'NN', 'NNS', 'NNP', 'NNPS', 'JJ', 'JJR', 'JJS', 'VB', 'VBG', 'VBN'}
-        important_words = []
+        
         for word, pos in tagged:
             clean_word = re.sub(r'[^\w]', '', word)
             if (len(clean_word) > 2 and
                 clean_word not in self.stop_words and
                 not clean_word.isdigit() and
                 pos in important_pos):
-                important_words.append(clean_word)
-        # Fallback: if nothing found, use original logic
-        if not important_words:
+                
+                weight = self._calculate_keyword_importance(clean_word, pos, prompt)
+                keyword_weights[clean_word] = weight
+        
+        # Fallback: if nothing found, use original logic with default weights
+        if not keyword_weights:
             for word in prompt.lower().split():
                 clean_word = re.sub(r'[^\w]', '', word)
                 if (len(clean_word) > 2 and 
                     clean_word not in self.stop_words and
                     not clean_word.isdigit()):
-                    important_words.append(clean_word)
-        return important_words[:8]  # Limit to most important 8 keywords
+                    keyword_weights[clean_word] = 1.0
+        
+        # Return sorted list of (keyword, weight) tuples - most important first
+        sorted_keywords = sorted(keyword_weights.items(), key=lambda x: x[1], reverse=True)
+        return sorted_keywords[:8]  # Limit to most important 8 keywords
     
-    def _get_feature_status(self, feature_score, overall_score):
+    def _get_feature_status(self, feature_score, overall_score, keyword=None):
         """Determine status of a feature relative to overall image match"""
+        
         if feature_score < 0.15:
             return "missing"
         elif feature_score < 0.22:
@@ -207,11 +264,88 @@ class ImagePromptEvaluator:
         else:
             return "present"
     
+    def _is_animal_or_living_thing(self, word):
+        """Use WordNet to determine if a word represents an animal or living thing"""
+        try:
+            # Get all synsets (word meanings) for the word
+            synsets = wordnet.synsets(word.lower())
+            
+            if not synsets:
+                return False
+            
+            # Check if any synset is related to animals or living things
+            for synset in synsets:
+                # Get hypernyms (parent categories) up the hierarchy
+                hypernyms = synset.closure(lambda s: s.hypernyms())
+                
+                # Check for animal-related categories
+                animal_categories = {
+                    'animal.n.01',     # animal, animate being, beast, brute, creature, fauna
+                    'organism.n.01',   # organism, being
+                    'living_thing.n.01', # living thing, animate thing
+                    'vertebrate.n.01', # vertebrate, craniate
+                    'mammal.n.01',     # mammal, mammalian
+                    'bird.n.01',       # bird
+                    'reptile.n.01',    # reptile, reptilian
+                    'fish.n.01',       # fish
+                    'insect.n.01',     # insect
+                    'arthropod.n.01'   # arthropod
+                }
+                
+                for hypernym in hypernyms:
+                    if hypernym.name() in animal_categories:
+                        return True
+                        
+                # Also check the synset itself
+                if synset.name() in animal_categories:
+                    return True
+                    
+            return False
+            
+        except Exception:
+            # Fallback to simple keyword checking if WordNet fails
+            biological_terms = {
+                'animal', 'creature', 'beast', 'wildlife', 'pet', 'mammal', 
+                'bird', 'fish', 'reptile', 'insect', 'amphibian'
+            }
+            return word.lower() in biological_terms
+    
+    def _get_semantic_category(self, word):
+        """Get semantic category using WordNet"""
+        try:
+            synsets = wordnet.synsets(word.lower())
+            if not synsets:
+                return "unknown"
+            
+            # Check primary synset for category
+            primary_synset = synsets[0]
+            hypernyms = primary_synset.closure(lambda s: s.hypernyms())
+            
+            # Define category mappings
+            categories = {
+                'vehicle': ['vehicle.n.01', 'motor_vehicle.n.01', 'craft.n.02'],
+                'animal': ['animal.n.01', 'organism.n.01', 'living_thing.n.01'],
+                'person': ['person.n.01', 'human.n.01', 'individual.n.01'],
+                'object': ['artifact.n.01', 'physical_entity.n.01'],
+                'place': ['location.n.01', 'place.n.01', 'region.n.03'],
+                'action': ['act.n.02', 'action.n.01', 'activity.n.01']
+            }
+            
+            for category, category_synsets in categories.items():
+                for hypernym in hypernyms:
+                    if hypernym.name() in category_synsets:
+                        return category
+                        
+            return "unknown"
+            
+        except Exception:
+            return "unknown"
+    
     def _analyze_missing_features(self, image_path, prompt, overall_similarity):
-        """Enhanced analysis of missing features with better feedback"""
+        """Enhanced analysis of missing features with importance-weighted penalties"""
         
-        # Extract important keywords (nouns, adjectives, key descriptors)
-        important_keywords = self._extract_important_keywords(prompt)
+        # Extract important keywords with weights (returns list of (keyword, weight) tuples)
+        weighted_keywords = self._extract_important_keywords(prompt)
         
         image = Image.open(image_path)
         image_input = self.preprocess(image).unsqueeze(0).to(self.device)
@@ -224,7 +358,7 @@ class ImagePromptEvaluator:
             image_features = self.model.encode_image(image_input)
             image_features = image_features / image_features.norm(dim=-1, keepdim=True)
             
-            for keyword in important_keywords:
+            for keyword, importance_weight in weighted_keywords:
                 # Test multiple variations for better detection
                 test_prompts = [
                     f"an image containing {keyword}",
@@ -246,20 +380,32 @@ class ImagePromptEvaluator:
                 best_score = max(kw_similarities)
                 confidence = self._normalize_score(best_score)
                 
-                # Categorize features based on confidence
+                # Categorize features with importance weighting
                 feature_info = {
                     "keyword": keyword,
                     "confidence": confidence,
                     "raw_score": best_score,
-                    "status": self._get_feature_status(best_score, overall_similarity)
+                    "importance_weight": importance_weight,
+                    "status": self._get_feature_status(best_score, overall_similarity, keyword)
                 }
                 
-                if best_score < 0.15:  # Clearly missing
-                    missing_features.append(feature_info)
-                elif best_score < 0.22:  # Weakly present
-                    weak_features.append(feature_info)
-                else:  # Clearly present
-                    present_features.append(feature_info)
+                # Use simple WordNet to detect animals/living things for stricter thresholds
+                if self._is_animal_or_living_thing(keyword):
+                    # Stricter thresholds for animals and living things
+                    if best_score < 0.18:  # Missing
+                        missing_features.append(feature_info)
+                    elif best_score < 0.28:  # Weak
+                        weak_features.append(feature_info)
+                    else:  # Present
+                        present_features.append(feature_info)
+                else:
+                    # Standard thresholds for non-living features
+                    if best_score < 0.15:  # Missing
+                        missing_features.append(feature_info)
+                    elif best_score < 0.22:  # Weak
+                        weak_features.append(feature_info)
+                    else:  # Present
+                        present_features.append(feature_info)
         
         return {
             "missing_features": missing_features,
@@ -267,41 +413,58 @@ class ImagePromptEvaluator:
             "present_features": present_features,
             "missing_count": len(missing_features),
             "weak_count": len(weak_features),
-            "total_features": len(important_keywords)
+            "total_features": len(weighted_keywords)
         }
     
     def _calculate_missing_feature_penalty(self, missing_analysis, overall_similarity):
-        """Apply penalty based on missing critical features"""
-        missing_count = missing_analysis["missing_count"]
-        weak_count = missing_analysis["weak_count"]
+        """Apply weighted penalty based on missing critical features and their importance"""
+        missing_features = missing_analysis["missing_features"]
+        weak_features = missing_analysis["weak_features"]
         total_count = missing_analysis["total_features"]
         
         if total_count == 0:
             return overall_similarity
         
-        missing_ratio = missing_count / total_count
-        weak_ratio = weak_count / total_count
+        # Calculate weighted penalties
+        total_missing_weight = sum(feature["importance_weight"] for feature in missing_features)
+        total_weak_weight = sum(feature["importance_weight"] for feature in weak_features)
+        total_possible_weight = sum(
+            feature["importance_weight"] for feature in 
+            missing_features + weak_features + missing_analysis["present_features"]
+        )
         
-        # Apply graduated penalty based on missing feature ratio
+        if total_possible_weight == 0:
+            return overall_similarity
+        
+        # Calculate weighted ratios
+        weighted_missing_ratio = total_missing_weight / total_possible_weight
+        weighted_weak_ratio = total_weak_weight / total_possible_weight
+        
+        # Apply graduated penalty based on weighted missing feature ratio
         penalty = 0
-        if missing_ratio > 0.6:  # More than 60% missing
-            penalty = 0.3
-        elif missing_ratio > 0.4:  # More than 40% missing
-            penalty = 0.2
-        elif missing_ratio > 0.2:  # More than 20% missing
-            penalty = 0.1
+        if weighted_missing_ratio > 0.6:  # More than 60% importance missing
+            penalty = 0.35
+        elif weighted_missing_ratio > 0.4:  # More than 40% importance missing
+            penalty = 0.25
+        elif weighted_missing_ratio > 0.2:  # More than 20% importance missing
+            penalty = 0.15
         
-        # Additional penalty for weak features
-        if weak_ratio > 0.4:
-            penalty += 0.1
-        elif weak_ratio > 0.2:
-            penalty += 0.05
+        # Additional penalty for weak important features
+        if weighted_weak_ratio > 0.4:
+            penalty += 0.12
+        elif weighted_weak_ratio > 0.2:
+            penalty += 0.08
         
-        penalty = min(penalty, 0.4)  # Cap maximum penalty at 40%
+        # Extra penalty for missing very important features (weight > 2.5)
+        high_importance_missing = [f for f in missing_features if f["importance_weight"] > 2.5]
+        if high_importance_missing:
+            penalty += len(high_importance_missing) * 0.1
+        
+        penalty = min(penalty, 0.5)  # Cap maximum penalty at 50%
         return overall_similarity * (1 - penalty)
     
     def _generate_missing_feature_feedback(self, missing_analysis):
-        """Generate human-readable feedback about missing features"""
+        """Generate human-readable feedback about missing features with importance indicators"""
         missing = missing_analysis["missing_features"]
         weak = missing_analysis["weak_features"]
         present = missing_analysis["present_features"]
@@ -309,12 +472,22 @@ class ImagePromptEvaluator:
         feedback = []
         
         if missing:
-            missing_names = [f["keyword"] for f in missing]
-            feedback.append(f"❌ Missing features: {', '.join(missing_names[:4])}")
+            # Sort by importance weight (highest first)
+            sorted_missing = sorted(missing, key=lambda x: x["importance_weight"], reverse=True)
+            missing_with_importance = []
+            for f in sorted_missing[:4]:
+                importance_indicator = "🔥" if f["importance_weight"] > 2.5 else "❗" if f["importance_weight"] > 2.0 else ""
+                missing_with_importance.append(f"{f['keyword']}{importance_indicator}")
+            feedback.append(f"❌ Missing features: {', '.join(missing_with_importance)}")
         
         if weak:
-            weak_names = [f["keyword"] for f in weak]
-            feedback.append(f"⚠️  Weak features: {', '.join(weak_names[:3])}")
+            # Sort by importance weight (highest first)
+            sorted_weak = sorted(weak, key=lambda x: x["importance_weight"], reverse=True)
+            weak_with_importance = []
+            for f in sorted_weak[:3]:
+                importance_indicator = "🔥" if f["importance_weight"] > 2.5 else "❗" if f["importance_weight"] > 2.0 else ""
+                weak_with_importance.append(f"{f['keyword']}{importance_indicator}")
+            feedback.append(f"⚠️  Weak features: {', '.join(weak_with_importance)}")
         
         if len(missing) + len(weak) == 0:
             feedback.append("✅ All key features are well represented")
@@ -323,7 +496,8 @@ class ImagePromptEvaluator:
         
         # Specific improvement suggestions
         if missing:
-            feedback.append(f"💡 Consider regenerating to include: {', '.join(missing_names[:3])}")
+            top_missing = [f["keyword"] for f in sorted(missing, key=lambda x: x["importance_weight"], reverse=True)[:3]]
+            feedback.append(f"💡 Consider regenerating to include: {', '.join(top_missing)}")
         
         return " | ".join(feedback)
     
